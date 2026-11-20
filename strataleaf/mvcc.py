@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from .access import authorize
 from .codec import loads
 from .errors import InvalidDocument, NotFound, SnapshotTooOld
 
@@ -40,8 +41,9 @@ def record(row):
     return Record(row["collection"], row["key"], row["rev"], loads(row["body"]), row["expires"])
 
 
-def read_record(store, collection, key, revision=None):
+def read_record(store, collection, key, revision=None, principal=None):
     with store.read() as connection:
+        authorize(store, connection, principal).require_read(collection)
         if not connection.execute("SELECT 1 FROM collections WHERE name=?", (collection,)).fetchone():
             raise NotFound("unknown collection: " + collection)
         revision = checked_revision(store, revision)

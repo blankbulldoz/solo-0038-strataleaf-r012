@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from .access import authorize
 from .codec import digest
 from .cursors import decode_cursor, encode_cursor
 from .errors import InvalidCursor, InvalidDocument, NotFound
@@ -16,14 +17,17 @@ class Page:
 
 
 class QueryEngine:
-    def __init__(self, store):
+    def __init__(self, store, principal=None):
         self.store = store
+        self.principal = principal
 
     def select(self, collection, predicate=None, limit=100, cursor=None, revision=None, force_scan=False):
         validate_predicate(predicate)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise InvalidDocument("page size must be between 1 and 1000")
         with self.store.read() as connection:
+            authority = authorize(self.store, connection, self.principal)
+            authority.require_read(collection)
             if not connection.execute("SELECT 1 FROM collections WHERE name=?", (collection,)).fetchone():
                 raise NotFound("unknown collection")
             fingerprint = digest({"collection": collection, "predicate": predicate})
@@ -32,6 +36,13 @@ class QueryEngine:
                 payload = decode_cursor(self.store, cursor)
                 if payload.get("query") != fingerprint or (revision is not None and revision != payload.get("revision")):
                     raise InvalidCursor("cursor does not belong to this query/read revision")
+                if "grant" in payload or "principal" in payload:
+                    if payload.get("principal") != authority.name:
+                        raise InvalidCursor("cursor was issued to a different identity")
+                    if payload.get("grant") != authority.fingerprint:
+                        raise InvalidCursor("authorization changed since this cursor was issued; restart the query")
+                elif self.store.get("access_mode") != "open":
+                    raise InvalidCursor("cursor predates the identity boundary")
                 revision, after = payload.get("revision"), payload.get("after")
                 if not isinstance(after, str):
                     raise InvalidCursor("cursor has no key boundary")
@@ -64,5 +75,7 @@ class QueryEngine:
             if len(output) > limit:
                 output = output[:limit]
                 continuation = encode_cursor(self.store, {"database": self.store.get("database_id"),
-                    "query": fingerprint, "revision": revision, "after": output[-1].key})
+                    "query": fingerprint, "revision": revision, "after": output[-1].key,
+                    "principal": authority.name,
+                    "grant": authority.fingerprint})
             return Page(output, revision, continuation, {**plan, "examined": examined})

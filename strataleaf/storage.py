@@ -22,8 +22,9 @@ CREATE TABLE IF NOT EXISTS index_values (
  collection TEXT NOT NULL, name TEXT NOT NULL, token TEXT NOT NULL, key TEXT NOT NULL,
  PRIMARY KEY(collection,name,token,key), FOREIGN KEY(collection,name) REFERENCES index_defs(collection,name) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS index_document ON index_values(collection,key);
-CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, rev INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS consumers (name TEXT PRIMARY KEY, ack INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, rev INTEGER NOT NULL, owner TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS consumers (name TEXT PRIMARY KEY, ack INTEGER NOT NULL, owner TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS principals (name TEXT PRIMARY KEY, grant TEXT NOT NULL);
 """
 
 
@@ -38,9 +39,11 @@ class Storage:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.executescript(DDL)
+        self._upgrade_hold_owners()
         with self.atomic():
             initial = {"format": "1", "head": "0", "floor": "0", "database_id": str(uuid.uuid4()),
-                       "cursor_secret": secrets.token_hex(32), "mode": "primary", "upstream": "", "catalog_epoch": "0"}
+                       "cursor_secret": secrets.token_hex(32), "mode": "primary", "upstream": "", "catalog_epoch": "0",
+                       "access_mode": "open", "auth_epoch": "0"}
             for key, value in initial.items():
                 self.connection.execute("INSERT OR IGNORE INTO meta VALUES (?,?)", (key, value))
             if self.get("format") != "1":
@@ -51,6 +54,14 @@ class Storage:
         if row is None:
             raise DatabaseError("missing storage metadata: " + key)
         return row[0]
+
+    def _upgrade_hold_owners(self):
+        """Add owner columns to pins/consumers written by earlier versions."""
+        for table in ("pins", "consumers"):
+            columns = {row[1] for row in self.connection.execute("PRAGMA table_info(" + table + ")")}
+            if "owner" not in columns:
+                with self.atomic():
+                    self.connection.execute("ALTER TABLE " + table + " ADD COLUMN owner TEXT NOT NULL DEFAULT ''")
 
     def set(self, key, value):
         self.connection.execute("UPDATE meta SET value=? WHERE key=?", (str(value), key))

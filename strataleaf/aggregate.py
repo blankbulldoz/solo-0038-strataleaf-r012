@@ -1,12 +1,14 @@
+from .access import authorize
 from .codec import MISSING, dumps, field, loads
-from .errors import InvalidDocument, NotFound
+from .errors import NotFound
 from .mvcc import checked_revision, visible_rows
 from .predicates import matches, validate_predicate
 
 
 class Aggregates:
-    def __init__(self, store):
+    def __init__(self, store, principal=None):
         self.store = store
+        self.principal = principal
 
     def group(self, collection, by, measure=None, predicate=None, revision=None):
         field({}, by)
@@ -14,9 +16,10 @@ class Aggregates:
             field({}, measure)
         validate_predicate(predicate)
         with self.store.read() as connection:
-            revision = checked_revision(self.store, revision)
+            authorize(self.store, connection, self.principal).require_read(collection)
             if not connection.execute("SELECT 1 FROM collections WHERE name=?", (collection,)).fetchone():
                 raise NotFound("unknown collection")
+            revision = checked_revision(self.store, revision)
             groups = {}
             for row in visible_rows(connection, collection, revision):
                 document = loads(row["body"])

@@ -1,3 +1,4 @@
+from .access import authorize
 from .codec import MISSING, field, loads, name, scalar_token
 from .errors import Conflict, InvalidDocument, NotFound
 from .mvcc import visible_rows
@@ -20,8 +21,9 @@ def refresh_document(connection, collection, key, document):
 
 
 class Indexes:
-    def __init__(self, store):
+    def __init__(self, store, principal=None):
         self.store = store
+        self.principal = principal
 
     def create(self, collection, index_name, path, unique=False):
         name(index_name)
@@ -29,6 +31,7 @@ class Indexes:
         if not isinstance(unique, bool):
             raise InvalidDocument("unique must be boolean")
         with self.store.atomic(writable=True) as connection:
+            authorize(self.store, connection, self.principal).require_admin()
             if not connection.execute("SELECT 1 FROM collections WHERE name=?", (collection,)).fetchone():
                 raise NotFound("unknown collection")
             if connection.execute("SELECT 1 FROM index_defs WHERE collection=? AND name=?", (collection, index_name)).fetchone():
@@ -48,6 +51,7 @@ class Indexes:
 
     def drop(self, collection, index_name):
         with self.store.atomic(writable=True) as connection:
+            authorize(self.store, connection, self.principal).require_admin()
             changed = connection.execute("DELETE FROM index_defs WHERE collection=? AND name=?", (collection, index_name)).rowcount
             if not changed:
                 raise NotFound("unknown index")
@@ -55,6 +59,9 @@ class Indexes:
 
     def list(self, collection):
         with self.store.read() as connection:
+            authority = authorize(self.store, connection, self.principal)
+            if not authority.can_read(collection):
+                raise NotFound("unknown collection")
             return [dict(row) for row in connection.execute("SELECT * FROM index_defs WHERE collection=? ORDER BY name", (collection,))]
 
 

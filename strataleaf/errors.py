@@ -21,3 +21,6 @@ class ReadOnly(DatabaseError):
 
 class ReplicationError(DatabaseError):
     pass
+
+class PermissionDenied(DatabaseError):
+    pass

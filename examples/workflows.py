@@ -2,7 +2,8 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from strataleaf import Database, Archives, Conflict, InvalidDocument, InvalidCursor, ReadOnly, SnapshotTooOld, ReplicationError
+from strataleaf import (Database, Archives, Conflict, InvalidCursor, InvalidDocument, PermissionDenied,
+                        ReadOnly, SnapshotTooOld, ReplicationError)
 
 SCHEMA = {"fields": {"region": "string", "sequence": "integer", "code": "string"}, "required": ["region", "sequence"]}
 
@@ -145,6 +146,44 @@ def run(flow):
                           "duplicate": rejected(lambda: db.transfer.import_lines("copy_segments", exported["lines"]), Conflict)}
                 if len(db.query("copy_segments").records) != 6:
                     raise RuntimeError("logical import differs")
+            elif flow == "access":
+                # A single database handed to three service modules, each with
+                # a different grant, plus one administrator.
+                db.catalog.create("orders")
+                db.catalog.create("secrets")
+                db.access.define("admin", admin=True)
+                with Database(folder / "source.db", principal="admin") as admin:
+                    admin.access.define("report_reader", read=["orders", "secrets"])
+                    admin.access.define("ingest_writer", write=["orders"])
+                    reader = admin.as_principal("report_reader")
+                    writer = admin.as_principal("ingest_writer")
+                    admin.batch().put("orders", "o1", {"total": 5}).commit()
+                    admin.batch().put("secrets", "s1", {"token": "x"}).commit()
+                    admin.batch().put("orders", "o2", {"total": 7}).commit()
+                    denied_write = rejected(lambda: reader.batch().put("orders", "o3", {}).commit(), PermissionDenied)
+                    denied_read = rejected(lambda: writer.get("orders", "o1"), PermissionDenied)
+                    mixed = rejected(lambda: writer.batch().put("orders", "ok", {"total": 1})
+                                     .put("secrets", "leak", {"token": "y"}).commit(), PermissionDenied)
+                    if admin.get("orders", "ok") is not None:
+                        raise RuntimeError("a partially authorized batch wrote data")
+                    page = reader.query("orders", limit=1)
+                    admin.access.update("report_reader", read=["orders"])
+                    stale_cursor = rejected(lambda: reader.query("orders", limit=1, cursor=page.cursor), InvalidCursor)
+                    # A commit touching only an unreadable collection is hidden
+                    # from the writer's feed but delivered whole to an admin.
+                    hidden_commit = admin.batch().put("secrets", "s2", {"token": "z"}).commit()
+                    writer_feed = [commit["revision"] for commit in writer.feed.read(0)]
+                    admin_feed = [commit["revision"] for commit in admin.feed.read(0)]
+                    if hidden_commit.revision in writer_feed or hidden_commit.revision not in admin_feed:
+                        raise RuntimeError("feed scoping failed")
+                    revoked = admin.access.revoke("ingest_writer")
+                    after_revoke = rejected(lambda: writer.get("orders", "o1"), PermissionDenied)
+                    output = {"denied_write": denied_write, "denied_read": denied_read,
+                              "mixed_batch": mixed, "mixed_batch_absent": admin.get("secrets", "leak"),
+                              "stale_cursor": stale_cursor, "hidden_commit": hidden_commit.revision,
+                              "writer_feed": writer_feed, "admin_feed": admin_feed,
+                              "reader_feed": [commit["revision"] for commit in reader.feed.read(0)],
+                              "revoked": revoked, "after_revoke": after_revoke, "grants": admin.access.list()}
             else:
                 raise ValueError("unknown example workflow: " + flow)
             print(json.dumps({"workflow": flow, "result": output}, ensure_ascii=False, sort_keys=True, default=str))

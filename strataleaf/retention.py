@@ -1,4 +1,5 @@
 import math
+from .access import authorize
 from .codec import name
 from .errors import Conflict, InvalidDocument, NotFound
 from .mvcc import checked_revision
@@ -6,25 +7,40 @@ from .transaction import WriteBatch
 
 
 class Retention:
-    def __init__(self, store):
+    """History retention.  Pins belonging to a revoked identity stop protecting
+    history, so a revoked service cannot wedge the floor forever."""
+    def __init__(self, store, principal=None):
         self.store = store
+        self.principal = principal
 
     def pin(self, pin_name, revision=None):
         name(pin_name)
         with self.store.atomic() as connection:
+            authority = authorize(self.store, connection, self.principal)
             revision = checked_revision(self.store, revision)
             if connection.execute("SELECT 1 FROM pins WHERE name=?", (pin_name,)).fetchone():
                 raise Conflict("read pin already exists")
-            connection.execute("INSERT INTO pins VALUES (?,?)", (pin_name, revision))
+            connection.execute("INSERT INTO pins VALUES (?,?,?)", (pin_name, revision, authority.name or ""))
         return revision
+
+    def _owned(self, connection, pin_name, authority):
+        row = connection.execute("SELECT name,rev,owner FROM pins WHERE name=?", (pin_name,)).fetchone()
+        if row is None:
+            raise NotFound("unknown read pin")
+        if not authority.grant.admin and row["owner"] != (authority.name or ""):
+            raise NotFound("unknown read pin")
+        return row
 
     def unpin(self, pin_name):
         with self.store.atomic() as connection:
-            if not connection.execute("DELETE FROM pins WHERE name=?", (pin_name,)).rowcount:
-                raise NotFound("unknown read pin")
+            authority = authorize(self.store, connection, self.principal)
+            self._owned(connection, pin_name, authority)
+            connection.execute("DELETE FROM pins WHERE name=?", (pin_name,))
 
     def compact(self, target):
         with self.store.atomic(writable=True) as connection:
+            authority = authorize(self.store, connection, self.principal)
+            authority.require_admin()
             target = checked_revision(self.store, target)
             blockers = [row[0] for row in connection.execute("SELECT rev FROM pins UNION ALL SELECT ack FROM consumers")]
             boundary = min([target] + blockers)
@@ -45,13 +61,15 @@ class Retention:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10000:
             raise InvalidDocument("sweep limit must be between 1 and 10000")
         with self.store.read() as connection:
+            authority = authorize(self.store, connection, self.principal)
             rows = connection.execute("""SELECT v.* FROM versions v WHERE v.body IS NOT NULL AND v.expires<=?
               AND NOT EXISTS (SELECT 1 FROM versions n WHERE n.collection=v.collection AND n.key=v.key AND n.rev>v.rev)
-              ORDER BY v.expires,v.collection,v.key LIMIT ?""", (now, limit)).fetchall()
-        if not rows:
+              ORDER BY v.expires,v.collection,v.key""", (now,)).fetchall()
+            visible = [row for row in rows if authority.can_write(row["collection"])][:limit]
+        if not visible:
             return {"expired": 0, "revision": None}
-        batch = WriteBatch(self.store)
-        for row in rows:
+        batch = WriteBatch(self.store, None, self.principal)
+        for row in visible:
             batch.delete(row["collection"], row["key"], expected=row["rev"])
         result = batch.commit()
         return {"expired": result.count, "revision": result.revision}

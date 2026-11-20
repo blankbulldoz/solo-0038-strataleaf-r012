@@ -1,17 +1,29 @@
+from .access import authorize
 from .codec import digest, dumps, loads
-from .errors import Conflict, ReplicationError
+from .errors import ReplicationError
 from .indexes import refresh_document
 from .mvcc import checked_revision
 
 
 class Replication:
-    def __init__(self, store):
+    """Catch-up replication.
+
+    The envelope is an internal, already-authenticated channel between one
+    primary and its replica: ``sha256`` detects corruption, it does not
+    establish who sent the packet.  Whoever can feed ``apply`` can therefore
+    replace database content, so exported packets and any transport carrying
+    them must stay inside the trusted deployment.  Both endpoints require the
+    advisory capability; a replica only accepts packets bound to its upstream.
+    """
+    def __init__(self, store, principal=None):
         self.store = store
+        self.principal = principal
 
     def export(self, since, limit=100):
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise ReplicationError("replication limit must be between 1 and 1000 commits")
         with self.store.read() as connection:
+            authorize(self.store, connection, self.principal).require_admin()
             since = checked_revision(self.store, since)
             commits = [loads(row[0]) for row in connection.execute("SELECT payload FROM commits WHERE rev>? ORDER BY rev LIMIT ?", (since, limit))]
             body = {"format": 1, "source": self.store.get("database_id"), "since": since,
@@ -32,6 +44,7 @@ class Replication:
             if [item["revision"] for item in commits] != expected or body["through"] > body["head"]:
                 raise ReplicationError("replication envelope has a revision gap")
             with self.store.atomic() as connection:
+                authorize(self.store, connection, self.principal).require_admin()
                 if self.store.get("mode") != "replica" or self.store.get("upstream") != body["source"]:
                     raise ReplicationError("envelope does not match configured upstream")
                 head = int(self.store.get("head"))

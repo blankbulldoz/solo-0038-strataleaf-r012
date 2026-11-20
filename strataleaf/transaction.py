@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from .access import authorize
 from .codec import digest, dumps, key as checked_key, loads, name
 from .errors import Conflict, InvalidDocument, NotFound
 from .indexes import refresh_document
@@ -15,8 +16,9 @@ class CommitResult:
 
 
 class WriteBatch:
-    def __init__(self, store, request_key=None):
+    def __init__(self, store, request_key=None, principal=None):
         self.store = store
+        self.principal = principal
         self.request_key = checked_key(request_key) if request_key is not None else None
         self.operations = []
         self.state = "open"
@@ -61,6 +63,9 @@ class WriteBatch:
         fingerprint = digest(self.operations)
         try:
             with self.store.atomic(writable=True) as connection:
+                authority = authorize(self.store, connection, self.principal)
+                for operation in self.operations:
+                    authority.require_write(operation["collection"])
                 if self.request_key is not None:
                     prior = connection.execute("SELECT * FROM receipts WHERE request_key=?", (self.request_key,)).fetchone()
                     if prior:

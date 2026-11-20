@@ -1,13 +1,23 @@
+from .access import authorize
 from .codec import digest, field, loads, scalar_token
 from .mvcc import visible_rows
 
 
 class Diagnostics:
-    def __init__(self, store):
+    """Physical and logical inspection.
+
+    ``inspect`` reports the whole physical inventory, so it needs the advisory
+    capability.  ``fingerprint`` only covers collections the identity may read,
+    and names that scope, so a partial comparison cannot be mistaken for a
+    full-database one.
+    """
+    def __init__(self, store, principal=None):
         self.store = store
+        self.principal = principal
 
     def inspect(self, deep=False):
         with self.store.read() as connection:
+            authorize(self.store, connection, self.principal).require_admin()
             head, floor = int(self.store.get("head")), int(self.store.get("floor"))
             integrity = [row[0] for row in connection.execute("PRAGMA integrity_check" if deep else "PRAGMA quick_check")]
             references = [tuple(row) for row in connection.execute("PRAGMA foreign_key_check")]
@@ -48,10 +58,14 @@ class Diagnostics:
     def fingerprint(self, revision=None):
         from .mvcc import checked_revision
         with self.store.read() as connection:
+            authority = authorize(self.store, connection, self.principal)
             revision = checked_revision(self.store, revision)
             content = []
-            for collection in connection.execute("SELECT name FROM collections ORDER BY name"):
-                content.extend({"collection": collection[0], "key": row["key"], "revision": row["rev"],
+            readable = [row[0] for row in connection.execute("SELECT name FROM collections ORDER BY name")
+                        if authority.grant.admin or authority.can_read(row[0])]
+            for collection_name in readable:
+                content.extend({"collection": collection_name, "key": row["key"], "revision": row["rev"],
                                 "document": loads(row["body"]), "expires_at": row["expires"]}
-                               for row in visible_rows(connection, collection[0], revision))
-            return {"revision": revision, "documents": len(content), "sha256": digest(content)}
+                               for row in visible_rows(connection, collection_name, revision))
+            return {"revision": revision, "documents": len(content), "sha256": digest(content),
+                    "scope": "all" if authority.grant.admin else readable}

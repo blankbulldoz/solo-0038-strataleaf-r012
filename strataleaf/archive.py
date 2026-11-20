@@ -5,7 +5,8 @@ import tempfile
 import secrets
 import uuid
 from pathlib import Path
-from .errors import Conflict, DatabaseError, InvalidDocument
+from .access import authorize
+from .errors import Conflict, DatabaseError
 
 
 def file_digest(path):
@@ -22,8 +23,13 @@ def inspect_archive(path):
         result = connection.execute("PRAGMA integrity_check").fetchone()[0]
         values = dict(connection.execute("SELECT key,value FROM meta"))
         required = {"head", "floor", "format", "database_id", "cursor_secret", "mode", "upstream"}
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if result != "ok" or not required.issubset(values) or values["format"] != "1":
             raise DatabaseError("archive is not a supported intact database")
+        if values.get("access_mode", "open") not in {"open", "enforced"}:
+            raise DatabaseError("archive has an unknown access mode")
+        if values.get("access_mode") == "enforced" and "principals" not in tables:
+            raise DatabaseError("archive claims enforced access without an identity table")
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise DatabaseError("archive has broken references")
         return {"revision": int(values["head"]), "floor": int(values["floor"]),
@@ -35,8 +41,15 @@ def inspect_archive(path):
 
 
 class Archives:
-    def __init__(self, store):
+    """Online backup and restore.
+
+    A backup is a complete physical copy, including the principals table, so
+    only an advisory identity may create one.  A backup file is not a
+    credential: possession of it is full control of the copied data.
+    """
+    def __init__(self, store, principal=None):
         self.store = store
+        self.principal = principal
 
     def backup(self, destination):
         destination = Path(destination).resolve()
@@ -49,6 +62,8 @@ class Archives:
             with self.store.lock:
                 if self.store.closed:
                     raise DatabaseError("database handle is closed")
+                with self.store.read() as connection:
+                    authorize(self.store, connection, self.principal).require_admin()
                 target = sqlite3.connect(temporary)
                 try:
                     self.store.connection.backup(target)
@@ -82,6 +97,11 @@ class Archives:
             target.execute("UPDATE meta SET value=? WHERE key='mode'", ("replica" if follower else "primary",))
             target.execute("UPDATE meta SET value=? WHERE key='upstream'", (receipt["database_id"] if follower else "",))
             if not follower:
+                # A restored primary is a new database identity: new id and new
+                # cursor signing key, so cursors minted before the restore never
+                # validate here.  The identity configuration itself is preserved
+                # exactly as archived: restore is a file operation performed by
+                # an operator who already holds the whole database.
                 target.execute("UPDATE meta SET value=? WHERE key='database_id'", (str(uuid.uuid4()),))
                 target.execute("UPDATE meta SET value=? WHERE key='cursor_secret'", (secrets.token_hex(32),))
             target.execute("DELETE FROM pins")
